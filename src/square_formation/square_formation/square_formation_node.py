@@ -1,110 +1,193 @@
-import math
-from functools import partial
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from example_interfaces.msg import Empty
 from std_msgs.msg import Bool
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+import math
 
 class SquareFormationNode(Node):
     def __init__(self):
         super().__init__('square_formation_node')
-        self.robots = ['robot1','robot2','robot3','robot4']
-        self.positions = {'robot1':(0,0),'robot2':(1,0),'robot3':(1,1),'robot4':(0,1)}
-        self.declare_parameter('robot_name','robot1')
+
+        # Shared robot list across all instances
+        self.robots = ['robot1', 'robot2', 'robot3', 'robot4']
+
+        # Parameters
+        self.declare_parameter('robot_name', 'robot1')
         self.robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
 
+        # Square positions (edit as needed)
+        self.positions = {
+            'robot1': (0.0, 0.0),
+            'robot2': (1.0, 0.0),
+            'robot3': (1.0, 1.0),
+            'robot4': (0.0, 1.0),
+        }
+
+        # State
         self.target_pose = self.positions[self.robot_name]
-        self.current_pose = (0.0,0.0); self.current_yaw = 0.0
-        self.has_goal = False; self.started_moving = False
-        self.alignment_statuses = dict.fromkeys(self.robots, False)
-        self.reached_statuses   = dict.fromkeys(self.robots, False)
+        self.current_pose = (0.0, 0.0)
+        self.current_yaw = 0.0
+        self.has_goal = False          # set True on /left or /right
+        self.started_moving = False    # becomes True once all aligned
 
-        aligned_qos = QoSProfile(depth=1,
-                                reliability=QoSReliabilityPolicy.RELIABLE,
-                                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        # Alignment status of all robots (including self)
+        self.alignment_statuses = {r: False for r in self.robots}
 
+        # QoS for alignment topics: Transient Local + Reliable (latch-like)
+        aligned_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
+
+        # IO
         self.create_subscription(Odometry, f'/{self.robot_name}/odom', self.odom_callback, 10)
         self.cmd_vel_pub = self.create_publisher(Twist, f'/{self.robot_name}/cmd_vel', 10)
 
-        self.create_subscription(Empty, '/left', partial(self.neighbor_move, -1), 10)
-        self.create_subscription(Empty, '/right', partial(self.neighbor_move, +1), 10)
+        self.create_subscription(Empty, '/left', self.left_callback, 10)
+        self.create_subscription(Empty, '/right', self.right_callback, 10)
 
-        for r in self.robots:
-            self.create_subscription(Bool, f'/{r}/aligned',  partial(self._state_cb, self.alignment_statuses, r), aligned_qos)
-            self.create_subscription(Bool, f'/{r}/reached', partial(self._state_cb, self.reached_statuses,   r), 10)
+        # Subscribe to all robots' /aligned with matching QoS
+        for robot in self.robots:
+            self.create_subscription(Bool, f'/{robot}/aligned', self.aligned_callback_factory(robot), aligned_qos)
 
+        # Publish this robot's alignment with same QoS
         self.aligned_pub = self.create_publisher(Bool, f'/{self.robot_name}/aligned', aligned_qos)
-        self.reached_pub = self.create_publisher(Bool, f'/{self.robot_name}/reached', 10)
-        self._aligned_msg = Bool(); self._reached_msg = Bool()
 
-        self.angle_threshold = 0.15; self.dist_threshold = 0.10
-        self.max_angular_speed = 0.6; self.forward_speed = 0.1
-
+        # Control loop
         self.timer = self.create_timer(0.1, self.control_loop)
 
-    def odom_callback(self, msg: Odometry):
+        # Tunables
+        self.angle_threshold = 0.12     # radians; require decent alignment before starting
+        self.dist_threshold = 0.10      # meters; stop radius
+        self.max_angular_speed = 0.6    # rad/s; clamp for stability
+        self.v_max = 0.20               # m/s; maximum forward speed
+        self.k_ang = 2.0                # proportional gain for heading correction
+        self.k_lin = 0.8                # proportional gain for distance-based speed
+        self.slowdown_dist = 0.40       # m; start capping speed when close
+        self.v_near_max = 0.08          # m/s; cap when close to target
+        self.v_min = 0.03               # m/s; minimum useful forward speed
+
+    def odom_callback(self, msg):
         self.current_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
-        siny = 2*(q.w*q.z + q.x*q.y); cosy = 1 - 2*(q.y*q.y + q.z*q.z)
-        self.current_yaw = math.atan2(siny, cosy)
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)  # yaw from quaternion
 
-    def neighbor_move(self, direction:int, _msg=None):
+    def left_callback(self, _):
         idx = self.robots.index(self.robot_name)
-        neighbor = self.robots[(idx + direction) % len(self.robots)]
+        neighbor = self.robots[(idx - 1) % len(self.robots)]
         self.target_pose = self.positions[neighbor]
-        self.has_goal = True; self.started_moving = False
-        self.alignment_statuses = dict.fromkeys(self.robots, False)
-        self.reached_statuses = dict.fromkeys(self.robots, False)
-        self.publish_aligned(False); self.publish_reached(False)
-        self.get_logger().info(f'{self.robot_name}: {"LEFT" if direction<0 else "RIGHT"} -> {neighbor} {self.target_pose}')
+        self.has_goal = True
+        self.started_moving = False
+        # clear only our own alignment; keep others’ latched state
+        self.alignment_statuses[self.robot_name] = False
+        self.publish_aligned(False)
+        self.get_logger().info(f'{self.robot_name}: LEFT -> {neighbor} at {self.target_pose}')
 
-    def _state_cb(self, state_dict, key, msg: Bool):
-        state_dict[key] = bool(msg.data)
+    def right_callback(self, _):
+        idx = self.robots.index(self.robot_name)
+        neighbor = self.robots[(idx + 1) % len(self.robots)]
+        self.target_pose = self.positions[neighbor]
+        self.has_goal = True
+        self.started_moving = False
+        self.alignment_statuses[self.robot_name] = False
+        self.publish_aligned(False)
+        self.get_logger().info(f'{self.robot_name}: RIGHT -> {neighbor} at {self.target_pose}')
+
+    def aligned_callback_factory(self, robot):
+        def cb(msg: Bool):
+            self.alignment_statuses[robot] = bool(msg.data)
+        return cb
 
     def control_loop(self):
-        t = Twist()
+        twist = Twist()
+
+        # No goal pending: idle and advertise unaligned
         if not self.has_goal:
-            self.publish_aligned(False); self.cmd_vel_pub.publish(t); return
+            self.publish_aligned(False)
+            self.cmd_vel_pub.publish(twist)
+            return
 
-        x,y = self.current_pose; tx,ty = self.target_pose
-        dx,dy = tx-x, ty-y
+        # Compute geometry to target
+        x, y = self.current_pose
+        tx, ty = self.target_pose
+        dx, dy = (tx - x), (ty - y)
         target_angle = math.atan2(dy, dx)
-        angle_diff = ((target_angle - self.current_yaw) + math.pi) % (2*math.pi) - math.pi
-        dist = math.hypot(dx, dy)
+        angle_diff = self.normalize_angle(target_angle - self.current_yaw)
+        distance = math.hypot(dx, dy)
 
+        # Phase 1: Align in place before starting
         if not self.started_moving:
             if abs(angle_diff) > self.angle_threshold:
-                t.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, 2.0 * angle_diff))
-                self.publish_aligned(False); self.cmd_vel_pub.publish(t); return
+                twist.linear.x = 0.0
+                twist.angular.z = self.clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
+                self.publish_aligned(False)
+                self.cmd_vel_pub.publish(twist)
+                return
+            # Mark aligned locally and publish
+            self.alignment_statuses[self.robot_name] = True
             self.publish_aligned(True)
-            if all(self.alignment_statuses.values()):
+            if self.all_aligned():
                 self.started_moving = True
 
+        # Phase 2: Move with continuous heading correction and speed scaling
         if self.started_moving:
-            if dist > self.dist_threshold:
-                t.linear.x = self.forward_speed
+            if distance > self.dist_threshold:
+                # Proportional heading correction while moving
+                ang_cmd = self.clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
+
+                # Distance-based speed with alignment gating
+                v_cmd = min(self.v_max, self.k_lin * distance)
+                # Reduce forward motion if misaligned
+                v_cmd *= max(0.0, math.cos(angle_diff))
+                # Cap speed when near the goal
+                if distance < self.slowdown_dist:
+                    v_cmd = min(v_cmd, self.v_near_max)
+                # Enforce a small minimum to keep moving if commanded
+                if v_cmd > 0.0:
+                    v_cmd = max(v_cmd, self.v_min)
+
+                twist.linear.x = v_cmd
+                twist.angular.z = ang_cmd
             else:
-                if not self.reached_statuses[self.robot_name]:
-                    self.reached_statuses[self.robot_name] = True
-                    self.publish_reached(True)
-                if all(self.reached_statuses.values()):
-                    self.has_goal = False; self.started_moving = False
-                    self.publish_aligned(False)
-                    t = Twist()
+                # Reached goal: stop and clear only this robot’s state
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+                self.has_goal = False
+                self.started_moving = False
+                self.publish_aligned(False)
 
-        self.cmd_vel_pub.publish(t)
+        self.cmd_vel_pub.publish(twist)
 
-    def publish_aligned(self, b: bool):
-        self._aligned_msg.data = b; self.aligned_pub.publish(self._aligned_msg)
+    def all_aligned(self):
+        return all(self.alignment_statuses.values())
 
-    def publish_reached(self, b: bool):
-        self._reached_msg.data = b; self.reached_pub.publish(self._reached_msg)
+    def publish_aligned(self, aligned: bool):
+        self.aligned_pub.publish(Bool(data=aligned))
+
+    @staticmethod
+    def clamp(x, lo, hi):
+        return max(lo, min(hi, x))
+
+    @staticmethod
+    def normalize_angle(a):
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
 
 def main():
-    rclpy.init(); n = SquareFormationNode(); rclpy.spin(n); n.destroy_node(); rclpy.shutdown()
+    rclpy.init()
+    node = SquareFormationNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
