@@ -3,9 +3,14 @@
 <package format="3">
   <name>square_formation</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>A ROS2 package for square formation behavior of multiple robots</description>
   <maintainer email="142209057+ItsElex@users.noreply.github.com">elex</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
+
+  <!-- Dependencies needed -->
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>example_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
@@ -15,4 +20,7 @@
   <export>
     <build_type>ament_python</build_type>
   </export>
+
+  <!-- Install launch directory -->
 </package>
+
