@@ -30,8 +30,8 @@ class SquareFormationNode(Node):
         self.target_pose = self.positions[self.robot_name]
         self.current_pose = (0.0, 0.0)
         self.current_yaw = 0.0
-        self.has_goal = False          # set True on /left or /right
-        self.started_moving = False    # becomes True once all aligned
+        self.has_goal = False           # set True on /left or /right
+        self.started_moving = False     # becomes True once all aligned
 
         # Alignment status of all robots (including self)
         self.alignment_statuses = {r: False for r in self.robots}
@@ -60,23 +60,29 @@ class SquareFormationNode(Node):
         # Control loop
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        # Tunables
-        self.angle_threshold = 0.12     # radians; require decent alignment before starting
-        self.dist_threshold = 0.10      # meters; stop radius
-        self.max_angular_speed = 0.6    # rad/s; clamp for stability
-        self.v_max = 0.20               # m/s; maximum forward speed
-        self.k_ang = 2.0                # proportional gain for heading correction
-        self.k_lin = 0.8                # proportional gain for distance-based speed
-        self.slowdown_dist = 0.40       # m; start capping speed when close
-        self.v_near_max = 0.08          # m/s; cap when close to target
-        self.v_min = 0.03               # m/s; minimum useful forward speed
+        # Tunables for approach and finalization
+        self.angle_threshold = 0.12     # rad; require decent alignment before starting
+        self.dist_threshold = 0.10      # m; general stopping radius (kept for safety)
+        self.stop_dist = 0.06           # m; final acceptance radius (tighter)
+        self.final_yaw_thresh = 0.15    # rad; yaw tolerance at goal
+        self.stop_dwell_cycles = 8      # consecutive cycles inside tolerances to declare reached
+        self.in_goal_count = 0          # dwell counter
+
+        # Motion gains and limits
+        self.max_angular_speed = 0.6    # rad/s
+        self.v_max = 0.18               # m/s
+        self.k_ang = 2.0                # proportional heading gain
+        self.k_lin = 0.8                # proportional distance gain
+        self.slowdown_dist = 0.40       # m; begin aggressive slowing
+        self.v_near_max = 0.08          # m/s; cap when near
+        self.v_min = 0.03               # m/s; minimum forward when commanded
 
     def odom_callback(self, msg):
         self.current_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)  # yaw from quaternion
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def left_callback(self, _):
         idx = self.robots.index(self.robot_name)
@@ -84,9 +90,9 @@ class SquareFormationNode(Node):
         self.target_pose = self.positions[neighbor]
         self.has_goal = True
         self.started_moving = False
-        # clear only our own alignment; keep others’ latched state
         self.alignment_statuses[self.robot_name] = False
         self.publish_aligned(False)
+        self.in_goal_count = 0
         self.get_logger().info(f'{self.robot_name}: LEFT -> {neighbor} at {self.target_pose}')
 
     def right_callback(self, _):
@@ -97,6 +103,7 @@ class SquareFormationNode(Node):
         self.started_moving = False
         self.alignment_statuses[self.robot_name] = False
         self.publish_aligned(False)
+        self.in_goal_count = 0
         self.get_logger().info(f'{self.robot_name}: RIGHT -> {neighbor} at {self.target_pose}')
 
     def aligned_callback_factory(self, robot):
@@ -107,13 +114,12 @@ class SquareFormationNode(Node):
     def control_loop(self):
         twist = Twist()
 
-        # No goal pending: idle and advertise unaligned
         if not self.has_goal:
             self.publish_aligned(False)
             self.cmd_vel_pub.publish(twist)
             return
 
-        # Compute geometry to target
+        # Geometry to target
         x, y = self.current_pose
         tx, ty = self.target_pose
         dx, dy = (tx - x), (ty - y)
@@ -121,7 +127,7 @@ class SquareFormationNode(Node):
         angle_diff = self.normalize_angle(target_angle - self.current_yaw)
         distance = math.hypot(dx, dy)
 
-        # Phase 1: Align in place before starting
+        # Phase 1: Align before starting
         if not self.started_moving:
             if abs(angle_diff) > self.angle_threshold:
                 twist.linear.x = 0.0
@@ -129,38 +135,43 @@ class SquareFormationNode(Node):
                 self.publish_aligned(False)
                 self.cmd_vel_pub.publish(twist)
                 return
-            # Mark aligned locally and publish
             self.alignment_statuses[self.robot_name] = True
             self.publish_aligned(True)
             if self.all_aligned():
                 self.started_moving = True
+                self.in_goal_count = 0
 
-        # Phase 2: Move with continuous heading correction and speed scaling
+        # Phase 2: Guided approach with continuous heading correction
         if self.started_moving:
-            if distance > self.dist_threshold:
+            if distance > self.stop_dist:
                 # Proportional heading correction while moving
                 ang_cmd = self.clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
 
-                # Distance-based speed with alignment gating
+                # Distance-based speed, reduced when misaligned and near goal
                 v_cmd = min(self.v_max, self.k_lin * distance)
-                # Reduce forward motion if misaligned
                 v_cmd *= max(0.0, math.cos(angle_diff))
-                # Cap speed when near the goal
                 if distance < self.slowdown_dist:
                     v_cmd = min(v_cmd, self.v_near_max)
-                # Enforce a small minimum to keep moving if commanded
                 if v_cmd > 0.0:
                     v_cmd = max(v_cmd, self.v_min)
 
                 twist.linear.x = v_cmd
                 twist.angular.z = ang_cmd
+                self.in_goal_count = 0
             else:
-                # Reached goal: stop and clear only this robot’s state
+                # Finalization window: stop linear motion and optionally trim yaw, then dwell
                 twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.has_goal = False
-                self.started_moving = False
-                self.publish_aligned(False)
+                if abs(angle_diff) > self.final_yaw_thresh:
+                    twist.angular.z = self.clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
+                else:
+                    twist.angular.z = 0.0
+                self.in_goal_count += 1
+                if self.in_goal_count >= self.stop_dwell_cycles:
+                    # Declare reached; ready for next /left or /right
+                    self.has_goal = False
+                    self.started_moving = False
+                    self.publish_aligned(False)
+                    self.in_goal_count = 0
 
         self.cmd_vel_pub.publish(twist)
 
