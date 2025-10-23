@@ -2,77 +2,37 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    # Static TFs: map -> robotN/odom (translation only, identity rotation)
-    static_tfs = [
+    # Assuming you physically place them in a square formation:
+    # robot1 at origin, robot2 1m in +x, robot3 at (1,1), robot4 1m in +y
+    
+    return LaunchDescription([
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=[
-                '--x','0.0','--y','0.0','--z','0.0',
-                '--qx','0','--qy','0','--qz','0','--qw','1',
-                '--frame-id','map','--child-frame-id','robot1/odom'
-            ],
-            name='map_to_robot1_odom'
-        ),
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            arguments=[
-                '--x','1.0','--y','0.0','--z','0.0',
-                '--qx','0','--qy','0','--qz','0','--qw','1',
-                '--frame-id','map','--child-frame-id','robot2/odom'
-            ],
-            name='map_to_robot2_odom'
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '0.0',
+                      '--roll', '0', '--pitch', '0', '--yaw', '0',
+                      '--frame-id', 'map', '--child-frame-id', 'robot1/odom']
         ),
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=[
-                '--x','1.0','--y','1.0','--z','0.0',
-                '--qx','0','--qy','0','--qz','0','--qw','1',
-                '--frame-id','map','--child-frame-id','robot3/odom'
-            ],
-            name='map_to_robot3_odom'
+            arguments=['--x', '1.0', '--y', '0.0', '--z', '0.0',
+                      '--roll', '0', '--pitch', '0', '--yaw', '0',
+                      '--frame-id', 'map', '--child-frame-id', 'robot2/odom']
         ),
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=[
-                '--x','0.0','--y','1.0','--z','0.0',
-                '--qx','0','--qy','0','--qz','0','--qw','1',
-                '--frame-id','map','--child-frame-id','robot4/odom'
-            ],
-            name='map_to_robot4_odom'
-        ),
-    ]
-
-    # Formation controllers (one per robot)
-    formation_nodes = [
-        Node(
-            package='square_formation',
-            executable='square_formation_node',
-            name='square_formation_robot1',
-            parameters=[{'robot_name': 'robot1'}],
+            arguments=['--x', '1.0', '--y', '1.0', '--z', '0.0',
+                      '--roll', '0', '--pitch', '0', '--yaw', '0',
+                      '--frame-id', 'map', '--child-frame-id', 'robot3/odom']
         ),
         Node(
-            package='square_formation',
-            executable='square_formation_node',
-            name='square_formation_robot2',
-            parameters=[{'robot_name': 'robot2'}],
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            arguments=['--x', '0.0', '--y', '1.0', '--z', '0.0',
+                      '--roll', '0', '--pitch', '0', '--yaw', '0',
+                      '--frame-id', 'map', '--child-frame-id', 'robot4/odom']
         ),
-        Node(
-            package='square_formation',
-            executable='square_formation_node',
-            name='square_formation_robot3',
-            parameters=[{'robot_name': 'robot3'}],
-        ),
-        Node(
-            package='square_formation',
-            executable='square_formation_node',
-            name='square_formation_robot4',
-            parameters=[{'robot_name': 'robot4'}],
-        ),
-    ]
-
-    return LaunchDescription(static_tfs + formation_nodes)
+    ])
 
