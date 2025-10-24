@@ -39,6 +39,8 @@ class SquareFormationNode(Node):
         
         # Alignment flags across robots (for synchronized start)
         self.alignment_statuses = {r: False for r in self.robots}
+        self.alignment_hold_cycles = 5
+        self.alignment_hold_count = 0
         
         # QoS for aligned (latched-like)
         aligned_qos = QoSProfile(
@@ -130,6 +132,7 @@ class SquareFormationNode(Node):
         self.has_goal = True
         self.started_moving = False
         self.in_goal_count = 0
+        self.alignment_hold_count = 0
         
         self.get_logger().info(f'{self.robot_name}: Moving to corner {self.target_corner_idx}')
     
@@ -158,6 +161,7 @@ class SquareFormationNode(Node):
                 twist.linear.x = 0.0
                 twist.angular.z = self._clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
                 self._publish_aligned(False)
+                self.alignment_hold_count = 0
                 self.cmd_vel_pub.publish(twist)
                 return
             
@@ -165,8 +169,13 @@ class SquareFormationNode(Node):
             self._publish_aligned(True)
             
             if self._all_aligned():
-                self.started_moving = True
-                self.in_goal_count = 0
+                self.alignment_hold_count += 1
+                if self.alignment_hold_count >= self.alignment_hold_cycles:
+                    self.started_moving = True
+                    self.in_goal_count = 0
+                    self.alignment_hold_count = 0
+            else:
+                self.alignment_hold_count = 0
         
         if self.started_moving:
             if distance > self.stop_dist:
