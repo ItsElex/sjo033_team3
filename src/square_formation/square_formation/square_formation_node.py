@@ -39,8 +39,6 @@ class SquareFormationNode(Node):
         
         # Alignment flags across robots (for synchronized start)
         self.alignment_statuses = {r: False for r in self.robots}
-        self.alignment_hold_cycles = 5
-        self.alignment_hold_count = 0
         
         # QoS for aligned (latched-like)
         aligned_qos = QoSProfile(
@@ -64,77 +62,80 @@ class SquareFormationNode(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
         
         # Approach and goal-checking tunables
-        self.angle_threshold = 0.2
-        self.stop_dist = 0.08
-        self.final_yaw_thresh = 0.2
-        self.stop_dwell_cycles = 10
+        self.angle_threshold = 0.12  # rad to consider aligned to start
+        self.stop_dist = 0.06  # m final acceptance radius
+        self.final_yaw_thresh = 0.15  # rad yaw tolerance at goal
+        self.stop_dwell_cycles = 8  # consecutive cycles inside tolerances
         self.in_goal_count = 0
         
         # Motion gains and limits
-        self.max_angular_speed = 0.5
-        self.v_max = 0.15
-        self.k_ang = 1.8
-        self.k_lin = 0.7
-        self.slowdown_dist = 0.40
-        self.v_near_max = 0.08
-        self.v_min = 0.03
+        self.max_angular_speed = 0.6  # rad/s
+        self.v_max = 0.18  # m/s
+        self.k_ang = 2.0  # heading P-gain
+        self.k_lin = 0.8  # distance P-gain
+        self.slowdown_dist = 0.40  # m
+        self.v_near_max = 0.08  # m/s
+        self.v_min = 0.03  # m/s
         
         # Snap tolerance for selecting current corner at move start
-        self.snap_tol = 0.15
+        self.snap_tol = 0.12  # m
         
-        self.get_logger().info(f'{self.robot_name}: Square formation node initialized')
+        self.get_logger().info(f'{self.robot_name}: Square formation node initialized with TF2 transforms')
     
     def odom_cb(self, msg: Odometry):
         try:
+            # Create a PoseStamped from odometry
             pose_in_odom = PoseStamped()
             pose_in_odom.header = msg.header
             pose_in_odom.pose = msg.pose.pose
             
+            # Transform to map frame using Buffer.transform
             pose_in_map = self.tf_buffer.transform(
                 pose_in_odom,
                 'map',
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
             
+            # Extract position in map frame
             self.current_pose = (pose_in_map.pose.position.x, pose_in_map.pose.position.y)
             
+            # Extract yaw from quaternion
             q = pose_in_map.pose.orientation
             siny_cosp = 2 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
             self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
             
         except TransformException as ex:
-            self.get_logger().warn(f'Could not transform: {ex}')
+            self.get_logger().warn(f'Could not transform {self.robot_name}/odom to map: {ex}')
             return
     
     def left_cb(self, _):
-        if self.has_goal or self.started_moving:
-            return
         self._new_command(direction=-1)
     
     def right_cb(self, _):
-        if self.has_goal or self.started_moving:
-            return
         self._new_command(direction=+1)
     
     def _new_command(self, direction: int):
+        # Determine current corner index by nearest-corner snap
         nearest_idx = self._nearest_corner_index(self.current_pose)
         if self._dist2(self.current_pose, self.corners[nearest_idx]) <= self.snap_tol * self.snap_tol:
             self.current_corner_idx = nearest_idx
         
+        # Pick next corner relative to persisted index
         self.target_corner_idx = (self.current_corner_idx + direction) % len(self.corners)
         self.target_pose = self.corners[self.target_corner_idx]
         
+        # Reset alignment flags in-place (fresh barrier)
         for k in self.alignment_statuses:
             self.alignment_statuses[k] = False
         self._publish_aligned(False)
         
+        # Reset control state
         self.has_goal = True
         self.started_moving = False
         self.in_goal_count = 0
-        self.alignment_hold_count = 0
         
-        self.get_logger().info(f'{self.robot_name}: Moving to corner {self.target_corner_idx}')
+        self.get_logger().info(f'{self.robot_name}: cmd -> corner {self.target_corner_idx} at {self.target_pose}')
     
     def _aligned_cb_factory(self, robot):
         def cb(msg: Bool):
@@ -149,61 +150,49 @@ class SquareFormationNode(Node):
             self.cmd_vel_pub.publish(twist)
             return
         
+        # Geometry to current target
         x, y = self.current_pose
         tx, ty = self.target_pose
         dx, dy = (tx - x), (ty - y)
+        target_angle = math.atan2(dy, dx)
+        angle_diff = self._norm_ang(target_angle - self.current_yaw)
         distance = math.hypot(dx, dy)
         
-        # Avoid division by zero when at target
-        if distance < 0.001:  # Very close to target
-            target_angle = self.current_yaw  # Maintain current heading
-            angle_diff = 0.0
-        else:
-            target_angle = math.atan2(dy, dx)
-            angle_diff = self._norm_ang(target_angle - self.current_yaw)
-        
+        # Phase 1: align before starting
         if not self.started_moving:
             if abs(angle_diff) > self.angle_threshold:
                 twist.linear.x = 0.0
                 twist.angular.z = self._clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
                 self._publish_aligned(False)
-                self.alignment_hold_count = 0
                 self.cmd_vel_pub.publish(twist)
                 return
             
+            # aligned locally now
             self.alignment_statuses[self.robot_name] = True
             self._publish_aligned(True)
             
             if self._all_aligned():
-                self.alignment_hold_count += 1
-                if self.alignment_hold_count >= self.alignment_hold_cycles:
-                    self.started_moving = True
-                    self.in_goal_count = 0
-                    self.alignment_hold_count = 0
-            else:
-                self.alignment_hold_count = 0
+                self.started_moving = True
+                self.in_goal_count = 0
         
+        # Phase 2: guided approach with continuous heading correction and braking
         if self.started_moving:
             if distance > self.stop_dist:
                 ang_cmd = self._clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
+                v_cmd = min(self.v_max, self.k_lin * distance)
+                v_cmd *= max(0.0, math.cos(angle_diff))
                 
-                # Safe velocity calculation with zero-check
-                if distance > 0.001:
-                    v_cmd = min(self.v_max, self.k_lin * distance)
-                    v_cmd *= max(0.0, math.cos(angle_diff))
-                    
-                    if distance < self.slowdown_dist:
-                        v_cmd = min(v_cmd, self.v_near_max)
-                    
-                    if v_cmd > 0.0:
-                        v_cmd = max(v_cmd, self.v_min)
-                else:
-                    v_cmd = 0.0
+                if distance < self.slowdown_dist:
+                    v_cmd = min(v_cmd, self.v_near_max)
+                
+                if v_cmd > 0.0:
+                    v_cmd = max(v_cmd, self.v_min)
                 
                 twist.linear.x = v_cmd
                 twist.angular.z = ang_cmd
                 self.in_goal_count = 0
             else:
+                # Finalization: stop linear, trim yaw, require dwell
                 twist.linear.x = 0.0
                 
                 if abs(angle_diff) > self.final_yaw_thresh:
@@ -214,15 +203,16 @@ class SquareFormationNode(Node):
                 self.in_goal_count += 1
                 
                 if self.in_goal_count >= self.stop_dwell_cycles:
+                    # Commit arrival: persist new slot and finish
                     self.current_corner_idx = self.target_corner_idx
                     self.has_goal = False
                     self.started_moving = False
                     self._publish_aligned(False)
                     self.in_goal_count = 0
-                    self.get_logger().info(f'{self.robot_name}: Reached corner {self.current_corner_idx}')
         
         self.cmd_vel_pub.publish(twist)
     
+    # Helpers
     def _nearest_corner_index(self, pose_xy):
         x, y = pose_xy
         best_i, best_d = 0, float('inf')
