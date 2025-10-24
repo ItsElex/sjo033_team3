@@ -152,9 +152,15 @@ class SquareFormationNode(Node):
         x, y = self.current_pose
         tx, ty = self.target_pose
         dx, dy = (tx - x), (ty - y)
-        target_angle = math.atan2(dy, dx)
-        angle_diff = self._norm_ang(target_angle - self.current_yaw)
         distance = math.hypot(dx, dy)
+        
+        # Avoid division by zero when at target
+        if distance < 0.001:  # Very close to target
+            target_angle = self.current_yaw  # Maintain current heading
+            angle_diff = 0.0
+        else:
+            target_angle = math.atan2(dy, dx)
+            angle_diff = self._norm_ang(target_angle - self.current_yaw)
         
         if not self.started_moving:
             if abs(angle_diff) > self.angle_threshold:
@@ -180,14 +186,19 @@ class SquareFormationNode(Node):
         if self.started_moving:
             if distance > self.stop_dist:
                 ang_cmd = self._clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
-                v_cmd = min(self.v_max, self.k_lin * distance)
-                v_cmd *= max(0.0, math.cos(angle_diff))
                 
-                if distance < self.slowdown_dist:
-                    v_cmd = min(v_cmd, self.v_near_max)
-                
-                if v_cmd > 0.0:
-                    v_cmd = max(v_cmd, self.v_min)
+                # Safe velocity calculation with zero-check
+                if distance > 0.001:
+                    v_cmd = min(self.v_max, self.k_lin * distance)
+                    v_cmd *= max(0.0, math.cos(angle_diff))
+                    
+                    if distance < self.slowdown_dist:
+                        v_cmd = min(v_cmd, self.v_near_max)
+                    
+                    if v_cmd > 0.0:
+                        v_cmd = max(v_cmd, self.v_min)
+                else:
+                    v_cmd = 0.0
                 
                 twist.linear.x = v_cmd
                 twist.angular.z = ang_cmd
