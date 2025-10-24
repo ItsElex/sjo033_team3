@@ -62,90 +62,76 @@ class SquareFormationNode(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
         
         # Approach and goal-checking tunables
-        self.angle_threshold = 0.12  # rad to consider aligned to start
-        self.stop_dist = 0.06  # m final acceptance radius
-        self.final_yaw_thresh = 0.15  # rad yaw tolerance at goal
-        self.stop_dwell_cycles = 8  # consecutive cycles inside tolerances
+        self.angle_threshold = 0.2
+        self.stop_dist = 0.08
+        self.final_yaw_thresh = 0.2
+        self.stop_dwell_cycles = 10
         self.in_goal_count = 0
         
         # Motion gains and limits
-        self.max_angular_speed = 0.6  # rad/s
-        self.v_max = 0.18  # m/s
-        self.k_ang = 2.0  # heading P-gain
-        self.k_lin = 0.8  # distance P-gain
-        self.slowdown_dist = 0.40  # m
-        self.v_near_max = 0.08  # m/s
-        self.v_min = 0.03  # m/s
+        self.max_angular_speed = 0.5
+        self.v_max = 0.15
+        self.k_ang = 1.8
+        self.k_lin = 0.7
+        self.slowdown_dist = 0.40
+        self.v_near_max = 0.08
+        self.v_min = 0.03
         
         # Snap tolerance for selecting current corner at move start
-        self.snap_tol = 0.12  # m
+        self.snap_tol = 0.15
         
-        self.get_logger().info(f'{self.robot_name}: Square formation node initialized with TF2 transforms')
+        self.get_logger().info(f'{self.robot_name}: Square formation node initialized')
     
     def odom_cb(self, msg: Odometry):
         try:
-            # Get transform from map to this robot's odom frame
-            transform = self.tf_buffer.lookup_transform(
-                'map',
-                f'{self.robot_name}/odom',
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            
-            # Create a PoseStamped from odometry
             pose_in_odom = PoseStamped()
             pose_in_odom.header = msg.header
             pose_in_odom.pose = msg.pose.pose
             
-            # Transform the pose to map frame
-            pose_in_map = tf2_geometry_msgs.do_transform_pose(pose_in_odom, transform)
+            pose_in_map = self.tf_buffer.transform(
+                pose_in_odom,
+                'map',
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
             
-            # Extract position in map frame
             self.current_pose = (pose_in_map.pose.position.x, pose_in_map.pose.position.y)
             
-            # Extract yaw from quaternion
             q = pose_in_map.pose.orientation
             siny_cosp = 2 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
             self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
             
         except TransformException as ex:
-            self.get_logger().warn(f'Could not transform {self.robot_name}/odom to map: {ex}')
+            self.get_logger().warn(f'Could not transform: {ex}')
             return
     
     def left_cb(self, _):
-        # Optional: ignore commands while busy; uncomment to debounce
-        # if self.has_goal or self.started_moving:
-        #     return
+        if self.has_goal or self.started_moving:
+            return
         self._new_command(direction=-1)
     
     def right_cb(self, _):
-        # Optional: ignore commands while busy; uncomment to debounce
-        # if self.has_goal or self.started_moving:
-        #     return
+        if self.has_goal or self.started_moving:
+            return
         self._new_command(direction=+1)
     
     def _new_command(self, direction: int):
-        # Determine current corner index by nearest-corner snap
         nearest_idx = self._nearest_corner_index(self.current_pose)
         if self._dist2(self.current_pose, self.corners[nearest_idx]) <= self.snap_tol * self.snap_tol:
             self.current_corner_idx = nearest_idx
         
-        # Pick next corner relative to persisted index
         self.target_corner_idx = (self.current_corner_idx + direction) % len(self.corners)
         self.target_pose = self.corners[self.target_corner_idx]
         
-        # Reset alignment flags in-place (fresh barrier)
         for k in self.alignment_statuses:
             self.alignment_statuses[k] = False
         self._publish_aligned(False)
         
-        # Reset control state
         self.has_goal = True
         self.started_moving = False
         self.in_goal_count = 0
         
-        self.get_logger().info(f'{self.robot_name}: cmd -> corner {self.target_corner_idx} at {self.target_pose}')
+        self.get_logger().info(f'{self.robot_name}: Moving to corner {self.target_corner_idx}')
     
     def _aligned_cb_factory(self, robot):
         def cb(msg: Bool):
@@ -160,7 +146,6 @@ class SquareFormationNode(Node):
             self.cmd_vel_pub.publish(twist)
             return
         
-        # Geometry to current target
         x, y = self.current_pose
         tx, ty = self.target_pose
         dx, dy = (tx - x), (ty - y)
@@ -168,7 +153,6 @@ class SquareFormationNode(Node):
         angle_diff = self._norm_ang(target_angle - self.current_yaw)
         distance = math.hypot(dx, dy)
         
-        # Phase 1: align before starting
         if not self.started_moving:
             if abs(angle_diff) > self.angle_threshold:
                 twist.linear.x = 0.0
@@ -177,7 +161,6 @@ class SquareFormationNode(Node):
                 self.cmd_vel_pub.publish(twist)
                 return
             
-            # aligned locally now
             self.alignment_statuses[self.robot_name] = True
             self._publish_aligned(True)
             
@@ -185,7 +168,6 @@ class SquareFormationNode(Node):
                 self.started_moving = True
                 self.in_goal_count = 0
         
-        # Phase 2: guided approach with continuous heading correction and braking
         if self.started_moving:
             if distance > self.stop_dist:
                 ang_cmd = self._clamp(self.k_ang * angle_diff, -self.max_angular_speed, self.max_angular_speed)
@@ -202,7 +184,6 @@ class SquareFormationNode(Node):
                 twist.angular.z = ang_cmd
                 self.in_goal_count = 0
             else:
-                # Finalization: stop linear, trim yaw, require dwell
                 twist.linear.x = 0.0
                 
                 if abs(angle_diff) > self.final_yaw_thresh:
@@ -213,16 +194,15 @@ class SquareFormationNode(Node):
                 self.in_goal_count += 1
                 
                 if self.in_goal_count >= self.stop_dwell_cycles:
-                    # Commit arrival: persist new slot and finish
                     self.current_corner_idx = self.target_corner_idx
                     self.has_goal = False
                     self.started_moving = False
                     self._publish_aligned(False)
                     self.in_goal_count = 0
+                    self.get_logger().info(f'{self.robot_name}: Reached corner {self.current_corner_idx}')
         
         self.cmd_vel_pub.publish(twist)
     
-    # Helpers
     def _nearest_corner_index(self, pose_xy):
         x, y = pose_xy
         best_i, best_d = 0, float('inf')
