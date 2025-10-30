@@ -229,6 +229,7 @@ class SquareFormationNode(Node):
 
             # Only start moving when every robot's alignment_status is True (and therefore fresh)
             if self._all_aligned():
+                self.desired_yaw = self.current_yaw
                 self.started_moving = True
                 self.in_goal_count = 0
                 self.get_logger().info(f'{self.robot_name}: All aligned - starting move to corner {self.target_corner_idx}')
