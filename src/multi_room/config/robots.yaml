@@ -1,0 +1,22 @@
+robots:
+  - name: robot1
+    x_pose: "0.35"      # Near room 1
+    y_pose: "-0.3"
+    z_pose: 0.01
+    enabled: true
+  - name: robot2
+    x_pose: "-0.7"      # Near room 2
+    y_pose: "-0.5"
+    z_pose: 0.01
+    enabled: true
+  - name: robot3
+    x_pose: "-0.4"      # Near room 3
+    y_pose: "0.7"
+    z_pose: 0.01
+    enabled: true
+  - name: robot4
+    x_pose: "0.75"      # Near room 4
+    y_pose: "0.7"
+    z_pose: 0.01
+    enabled: true
+
